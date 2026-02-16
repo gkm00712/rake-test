@@ -3,24 +3,24 @@ import requests
 import base64
 import pandas as pd
 import urllib3
+import time
 from bs4 import BeautifulSoup
 from Crypto.Cipher import AES
 from Crypto.Hash import MD5
 from requests.adapters import HTTPAdapter
 from urllib3.util.retry import Retry
 
-# --- 0. CONFIGURATION & SAFETY ---
-# Disable "InsecureRequestWarning" because we are bypassing SSL verification
-# This is necessary for many legacy government portals.
+# --- 0. CONFIGURATION ---
+# Disable SSL Warnings (Mimics the Java code's TrustManager override)
 urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 
 # ==========================================
-# 1. ENCRYPTION LOGIC (Standard OpenSSL / Java Equivalent)
+# 1. ENCRYPTION LOGIC (Exact Java Replica)
 # ==========================================
 
 def evp_kdf(password, salt, key_size, iv_size):
     """
-    Replicates OpenSSL's EVP_BytesToKey to generate the AES Key and IV.
+    Replicates OpenSSL's EVP_BytesToKey (Java: EvpKDF function)
     """
     derived_key_iv = b""
     prev_block = b""
@@ -36,7 +36,7 @@ def evp_kdf(password, salt, key_size, iv_size):
 
 def encrypt_password(plain_password, salt_hex):
     """
-    Encrypts the password using AES-128-CBC with the server-provided salt.
+    Encrypts password using AES-128-CBC with the salt.
     """
     try:
         password_bytes = plain_password.encode('utf-8')
@@ -53,14 +53,14 @@ def encrypt_password(plain_password, salt_hex):
         
         encrypted_bytes = cipher.encrypt(padded_password)
         
-        # Combine into OpenSSL format: "Salted__" + Salt + EncryptedData
+        # Final Format: "Salted__" + Salt + EncryptedData
         final_payload = b"Salted__" + salt_bytes + encrypted_bytes
         return base64.b64encode(final_payload).decode('utf-8')
     except Exception as e:
         return None
 
 # ==========================================
-# 2. FOIS CLIENT CLASS (With Connection Fixes)
+# 2. FOIS CLIENT (The "Java App" in Python)
 # ==========================================
 
 class FOISConnector:
@@ -68,88 +68,97 @@ class FOISConnector:
         self.session = requests.Session()
         self.base_url = "https://www.fois.indianrail.gov.in/ecbs"
         
-        # --- FIX: ROBUST RETRY STRATEGY ---
-        # This prevents the app from crashing on a single dropped connection
+        # --- NETWORK RETRY LOGIC (To fix "Connection Refused") ---
         retry_strategy = Retry(
             total=3,
-            backoff_factor=1, # Wait 1s, 2s, 4s between retries
+            backoff_factor=1,
             status_forcelist=[429, 500, 502, 503, 504],
         )
         adapter = HTTPAdapter(max_retries=retry_strategy)
         self.session.mount("https://", adapter)
         self.session.mount("http://", adapter)
 
-        # --- FIX: HEADERS ---
-        # Mimic a real Chrome Browser to avoid bot detection
+        # --- HEADERS (Mimicking the Java App) ---
         self.session.headers.update({
-            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/115.0.0.0 Safari/537.36",
+            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/116.0.0.0 Safari/537.36",
+            "Content-Type": "application/x-www-form-urlencoded",
             "Origin": "https://www.fois.indianrail.gov.in",
-            "Referer": "https://www.fois.indianrail.gov.in/ecbs/JSP/LoginNew.jsp",
-            "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8"
+            "Referer": "https://www.fois.indianrail.gov.in/ecbs/JSP/LoginNew.jsp"
         })
 
     def get_salt(self):
+        """ Mimics accessing PassSecure to get the Hex Salt """
         try:
-            # Step 1: Hit Login Page (Sets JSESSIONID cookie)
-            # verify=False is CRITICAL for FOIS
+            # 1. Hit Login Page to set Cookies (JSESSIONID)
             self.session.get(f"{self.base_url}/JSP/LoginNew.jsp", timeout=15, verify=False)
             
-            # Step 2: Request Salt
+            # 2. Post to PassSecure
             response = self.session.post(f"{self.base_url}/PassSecure", timeout=15, verify=False)
             
             if response.status_code == 200:
-                salt = response.text.strip()
-                return salt
+                return response.text.strip()
             return None
         except Exception as e:
             st.error(f"Network Error (Get Salt): {e}")
             return None
 
-    def login(self, username, password, captcha_text="heebd"):
+    def login(self, username, password):
+        """ 
+        Mimics the 'FOISlogin' class. 
+        Uses hardcoded captcha 'heebd' just like the Java code. 
+        """
         salt = self.get_salt()
         if not salt:
-            return False, "Could not connect to FOIS server (Check VPN/Internet)."
+            return False, "Could not connect to FOIS server. (Are you inside India?)"
 
         encrypted_pass = encrypt_password(password, salt)
         if not encrypted_pass:
             return False, "Encryption failed."
 
+        # Exact parameters from the Java 'doInBackground' method
         payload = {
             "operation": "login",
             "txtUserId": username,
             "txtUserID": username.upper(),
             "passwd": encrypted_pass,
             "txtLangFlag": "E",
+            "txtSHYFlag": "", 
             "txtUserType": "0",
-            "txtCaptcha": captcha_text,
-            "answer": captcha_text
+            # The Java code hardcodes this:
+            "answer": "heebd" 
         }
 
         try:
-            # verify=False prevents SSL Error
+            # POST to RouterServlet
             response = self.session.post(f"{self.base_url}/RouterServlet", data=payload, timeout=20, verify=False)
             
-            # Check for success indicators in HTML
+            # Check for success
+            # If successful, FOIS usually returns a page with "Logout" or the user's name
             if "Logout" in response.text or "Welcome" in response.text or "Home" in response.text:
                 return True, "Login Successful"
             elif "Invalid" in response.text:
-                return False, "Invalid Credentials or Captcha."
+                return False, "Invalid Credentials."
             else:
-                # Sometimes successful login just redirects, return True to be safe
+                # Assuming success if no explicit error, as FOIS redirects are messy
                 return True, "Session Established"
         except Exception as e:
             return False, f"Login Request Error: {e}"
 
     def fetch_rake_insight(self, station_code, consignee):
+        """ Mimics the 'FOISinsight' class """
+        # Parameters from Java 'FOISinsight' class
         params = {
             "operation": "query",
             "suboperation": "insight",
             "txtSttnFrom": "",
             "txtSttnTo": station_code,
+            "txtCommodity": "",
+            "txtConsignor": "",
             "txtConsignee": consignee,
             "locnflag": "S",
             "user": consignee,
-            "usrflag": "C"
+            "usrflag": "C",
+            "txtSysDate": "" # Left empty, server usually defaults to today
         }
         try:
             response = self.session.get(f"{self.base_url}/RouterServlet", params=params, timeout=30, verify=False)
@@ -160,16 +169,16 @@ class FOISConnector:
         return pd.DataFrame()
 
     def parse_html_table(self, html):
+        """ Parses the HTML response into a Pandas DataFrame """
         soup = BeautifulSoup(html, 'html.parser')
         
-        # Look for the specific table ID used in FOIS
+        # Java code searches for <table id="example">
         table = soup.find('table', {'id': 'example'})
         
+        # Fallback if ID is missing
         if not table:
-            # Fallback: Try finding any table with 'ZoneCode' which is common in their reports
-            table = soup.find('table')
-            if not table:
-                return pd.DataFrame()
+            table = soup.find('table') 
+            if not table: return pd.DataFrame()
 
         # Headers
         headers = [th.get_text(strip=True) for th in table.find_all('th')]
@@ -182,69 +191,68 @@ class FOISConnector:
                 rows.append(cols)
         
         if rows:
-            # Fix header mismatch if necessary
             max_cols = max(len(r) for r in rows)
-            if not headers: 
-                headers = [f"Col_{i}" for i in range(max_cols)]
-            elif len(headers) < max_cols:
-                headers += [f"Col_{i}" for i in range(len(headers), max_cols)]
+            if not headers: headers = [f"Col_{i}" for i in range(max_cols)]
+            elif len(headers) < max_cols: headers += [f"Col_{i}" for i in range(len(headers), max_cols)]
             
-            # Create DataFrame
-            df = pd.DataFrame(rows, columns=headers[:max_cols])
-            return df
+            return pd.DataFrame(rows, columns=headers[:max_cols])
         return pd.DataFrame()
 
 # ==========================================
 # 3. STREAMLIT UI
 # ==========================================
 
-st.set_page_config(page_title="FOIS Tracker", layout="wide")
+st.set_page_config(page_title="FOIS Rake Tracker", layout="wide")
 
-st.title("🚂 FOIS Rake Tracker (Fixed)")
-st.markdown("Use this tool to fetch **Rake Insight** data. SSL Verification is disabled to support legacy servers.")
+st.title("🚂 FOIS Rake Tracker")
+st.markdown("""
+This tool mimics the `com.hpvirtualreality.coalrakes` Android app logic:
+1.  **Bypasses SSL Verification** (like the Java app).
+2.  **Hardcodes Captcha** to `heebd` (like the Java app).
+""")
 
-# Sidebar
-with st.sidebar:
-    st.header("🔐 Credentials")
+# --- INPUTS ---
+col1, col2 = st.columns(2)
+
+with col1:
+    st.subheader("1. Credentials")
     username = st.text_input("Username")
     password = st.text_input("Password", type="password")
-    
-    st.markdown("---")
-    st.header("📍 Parameters")
-    consignee = st.text_input("Consignee", value="TATA")
-    station = st.text_input("Station Code", value="NDLS")
-    
-    st.caption("Common Codes: NDLS, HWH, CSMT, TATA, SAIL")
-    
-    fetch_btn = st.button("🚀 Fetch Data", type="primary")
 
-# Main Logic
-if fetch_btn:
+with col2:
+    st.subheader("2. Search Parameters")
+    consignee = st.text_input("Consignee Code", value="TATA", help="e.g. TATA, SAIL, NTPC")
+    station = st.text_input("Station Code", value="NDLS", help="e.g. NDLS, HWH")
+
+st.info("ℹ️ **Note:** Connection errors usually mean you are blocked by the FOIS firewall. Run this script locally in India for best results.")
+
+if st.button("🚀 Connect & Fetch Data", type="primary"):
     if not username or not password:
-        st.error("⚠️ Please enter Username and Password.")
+        st.error("Please enter Username and Password.")
     else:
         connector = FOISConnector()
         
-        with st.status("Connecting to Indian Railways...", expanded=True) as status:
-            st.write("1. Initializing Connection (Bypassing SSL)...")
+        with st.status("Executing FOIS Protocol...", expanded=True) as status:
+            
+            st.write("🔹 Connecting to Server (SSL Bypassed)...")
             success, msg = connector.login(username, password)
             
             if success:
-                st.write(f"2. {msg}")
-                st.write("3. Fetching Insight Data...")
+                st.write(f"✅ {msg}")
+                st.write(f"🔹 Querying Insight for {consignee} @ {station}...")
                 
                 df = connector.fetch_rake_insight(station, consignee)
-                status.update(label="Complete!", state="complete", expanded=False)
+                status.update(label="Operation Complete", state="complete", expanded=False)
                 
                 if not df.empty:
-                    st.success(f"✅ Found {len(df)} records")
+                    st.success(f"Found {len(df)} Rakes!")
                     st.dataframe(df, use_container_width=True)
                     
+                    # CSV Download
                     csv = df.to_csv(index=False).encode('utf-8')
-                    st.download_button("📥 Download CSV", csv, "fois_data.csv", "text/csv")
+                    st.download_button("📥 Download Data as CSV", csv, "fois_rakes.csv", "text/csv")
                 else:
-                    st.warning("⚠️ Connection successful, but no data found for these inputs.")
+                    st.warning("No data found (or the hardcoded captcha 'heebd' is no longer accepted).")
             else:
-                status.update(label="Failed", state="error")
+                status.update(label="Login Failed", state="error")
                 st.error(f"❌ {msg}")
-                st.caption("Tip: If you are outside India, you may need a VPN with an Indian IP.")
